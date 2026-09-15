@@ -777,10 +777,7 @@ const _consoleRemoteObject = (value) => {
   }
   if (type === "symbol") return { type, description: String(value) };
   if (value instanceof Error) {
-    const _pst = Error.prepareStackTrace;
-    if (_pst !== undefined) Error.prepareStackTrace = undefined;
-    const description = value.stack || value.message || String(value);
-    if (_pst !== undefined) Error.prepareStackTrace = _pst;
+    const description = _consoleErrorText(value);
     return {
       type: "object", subtype: "error",
       className: (value.constructor && value.constructor.name) || "Error",
@@ -801,18 +798,33 @@ const _consoleRemoteObject = (value) => {
   remote.objectId = _consoleObjectId(value);
   return remote;
 };
+// Chrome without an attached inspector never runs page code while logging an
+// Error. Pages detect CDP by logging an Error whose `stack` is a getter and
+// checking whether it ran (BrowserScan, deviceandbrowserinfo), so logging reads
+// only V8's own native stack accessor and plain data properties.
+const _nativeErrorStackGetter = Object.getOwnPropertyDescriptor(new Error(), "stack").get;
+const _consoleErrorText = (error) => {
+  const userPrepareStackTrace = Error.prepareStackTrace;
+  if (userPrepareStackTrace !== undefined) Error.prepareStackTrace = undefined;
+  try {
+    const stack = Object.getOwnPropertyDescriptor(error, "stack");
+    if (stack && stack.get === _nativeErrorStackGetter) {
+      const text = _nativeErrorStackGetter.call(error);
+      if (text) return String(text);
+    }
+    const message = Object.getOwnPropertyDescriptor(error, "message");
+    if (message && "value" in message && message.value) return String(message.value);
+    return "Error";
+  } finally {
+    if (userPrepareStackTrace !== undefined) Error.prepareStackTrace = userPrepareStackTrace;
+  }
+};
 const _consoleFn = (level, args) => {
   try {
     const text = args.map(a => {
       if (a === null) return "null";
       if (a === undefined) return "undefined";
-      if (a instanceof Error) {
-        const _pst = Error.prepareStackTrace;
-        if (_pst !== undefined) Error.prepareStackTrace = undefined;
-        const _s = a.stack || a.message || String(a);
-        if (_pst !== undefined) Error.prepareStackTrace = _pst;
-        return _s;
-      }
+      if (a instanceof Error) return _consoleErrorText(a);
       if (typeof a === "object") {
         try {
           const s = JSON.stringify(a);
@@ -12903,77 +12915,6 @@ class _IframeWindow {
   blur() {}
 }
 
-// Encode an RGBA pixel buffer into a valid PNG data URL.
-// Uses stored-block DEFLATE (no compression) wrapped in zlib.
-// This produces a larger file than a real browser but the hash is unique
-// per session (from _fpNoise) and valid, so it does not match the known
-// headless stub.
-function _encodePNG(w, h, rgba) {
-  // RGBA scanlines: filter byte (0) + 4 bytes per pixel.
-  var rowLen = 1 + w * 4;
-  var raw = new Uint8Array(h * rowLen);
-  for (var y = 0; y < h; y++) {
-    var base = y * rowLen;
-    raw[base] = 0;
-    for (var x = 0; x < w; x++) {
-      var s = (y * w + x) << 2, d = base + 1 + x * 4;
-      raw[d] = rgba[s]; raw[d+1] = rgba[s+1]; raw[d+2] = rgba[s+2]; raw[d+3] = rgba[s+3];
-    }
-  }
-  // Adler32 of raw
-  var s1 = 1, s2 = 0, M = 65521;
-  for (var i = 0; i < raw.length; i++) { s1 = (s1 + raw[i]) % M; s2 = (s2 + s1) % M; }
-  var adler = ((s2 << 16) | s1) >>> 0;
-  // Stored DEFLATE blocks (zlib level 0)
-  var MAXB = 65535, nb = Math.ceil(raw.length / MAXB) || 1;
-  var dlen = 2 + nb * 5 + raw.length + 4;
-  var def = new Uint8Array(dlen), dp = 0;
-  def[dp++] = 0x78; def[dp++] = 0x01;
-  for (var bi = 0; bi < nb; bi++) {
-    var bs = bi * MAXB, be = Math.min(raw.length, bs + MAXB), bl = be - bs;
-    def[dp++] = bi === nb-1 ? 1 : 0;
-    def[dp++] = bl&0xff; def[dp++] = (bl>>8)&0xff;
-    def[dp++] = (~bl)&0xff; def[dp++] = (~bl>>8)&0xff;
-    def.set(raw.subarray(bs, be), dp); dp += bl;
-  }
-  def[dp++]=(adler>>24)&0xff; def[dp++]=(adler>>16)&0xff; def[dp++]=(adler>>8)&0xff; def[dp]=adler&0xff;
-  // CRC32 (lazy table)
-  if (!_encodePNG._t) {
-    var t = new Uint32Array(256);
-    for (var n = 0; n < 256; n++) { var c = n; for (var k=0;k<8;k++) c=c&1?0xEDB88320^(c>>>1):(c>>>1); t[n]=c; }
-    _encodePNG._t = t;
-  }
-  var T = _encodePNG._t;
-  function crc32(a, st, ln) { var c=0xFFFFFFFF; for(var i=st,e=st+ln;i<e;i++) c=T[(c^a[i])&0xff]^(c>>>8); return (c^0xFFFFFFFF)>>>0; }
-  function putChunk(out, off, type, data) {
-    var dl = data.length;
-    out[off]=(dl>>24)&0xff; out[off+1]=(dl>>16)&0xff; out[off+2]=(dl>>8)&0xff; out[off+3]=dl&0xff;
-    out[off+4]=type.charCodeAt(0); out[off+5]=type.charCodeAt(1); out[off+6]=type.charCodeAt(2); out[off+7]=type.charCodeAt(3);
-    out.set(data, off+8);
-    var cr = crc32(out, off+4, 4+dl);
-    out[off+8+dl]=(cr>>24)&0xff; out[off+9+dl]=(cr>>16)&0xff; out[off+10+dl]=(cr>>8)&0xff; out[off+11+dl]=cr&0xff;
-    return off+12+dl;
-  }
-  var ihd = new Uint8Array(13);
-  ihd[0]=(w>>24)&0xff; ihd[1]=(w>>16)&0xff; ihd[2]=(w>>8)&0xff; ihd[3]=w&0xff;
-  ihd[4]=(h>>24)&0xff; ihd[5]=(h>>16)&0xff; ihd[6]=(h>>8)&0xff; ihd[7]=h&0xff;
-  ihd[8]=8; ihd[9]=6; // 8-bit RGBA
-  var png = new Uint8Array(8 + 25 + (12+dlen) + 12);
-  png.set([0x89,0x50,0x4E,0x47,0x0D,0x0A,0x1A,0x0A]);
-  var p = 8;
-  p = putChunk(png, p, 'IHDR', ihd);
-  p = putChunk(png, p, 'IDAT', def);
-  putChunk(png, p, 'IEND', new Uint8Array(0));
-  // Base64 encode
-  var C = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/';
-  var b64 = 'data:image/png;base64,';
-  for (var i = 0; i < png.length; i += 3) {
-    var a=png[i], b=i+1<png.length?png[i+1]:0, c=i+2<png.length?png[i+2]:0;
-    b64 += C[a>>2] + C[((a&3)<<4)|(b>>4)] + (i+1<png.length?C[((b&15)<<2)|(c>>6)]:'=') + (i+2<png.length?C[c&63]:'=');
-  }
-  return b64;
-}
-
 globalThis.__ariaQuerySelector = function(root, selector) { return null; };
 globalThis.__ariaQuerySelectorAll = async function*(root, selector) { /* yields nothing */ };
 const _MAX_CANVAS_DIMENSION = 32767;
@@ -13258,41 +13199,50 @@ class HTMLCanvasElement extends Element {
 }
 globalThis.HTMLCanvasElement = HTMLCanvasElement;
 
-HTMLCanvasElement.prototype.getContext = function getContext(type) {
-  if (type === '2d') {
-    if (!this._ctx) {
-      try { this._ctx = new _Canvas2D(this); }
-      catch (_error) { return null; }
+// Method shorthand gives these the shape of WebIDL operations: no own
+// `prototype`, not constructible, so `class X extends toDataURL` and
+// `new getContext()` throw like Chrome (CreepJS "lies" checks).
+const _canvasElementOperations = {
+  getContext(type) {
+    if (type === '2d') {
+      if (!this._ctx) {
+        try { this._ctx = new _Canvas2D(this); }
+        catch (_error) { return null; }
+      }
+      return this._ctx;
     }
-    return this._ctx;
-  }
-  if (type === 'webgl' || type === 'experimental-webgl' || type === 'webgl2') {
-    // Context creation is allowed to fail, and that is the only truthful
-    // behavior until the renderer has a real WebGL backend. The former shim
-    // reported successful shader/program creation while every draw call was a
-    // no-op. Feature-detecting applications consequently selected their WebGL
-    // path, hid their HTML/image fallback, and produced a blank canvas.
+    if (type === 'webgl' || type === 'experimental-webgl' || type === 'webgl2') {
+      // Context creation is allowed to fail, and that is the only truthful
+      // behavior until the renderer has a real WebGL backend. The former shim
+      // reported successful shader/program creation while every draw call was a
+      // no-op. Feature-detecting applications consequently selected their WebGL
+      // path, hid their HTML/image fallback, and produced a blank canvas.
+      return null;
+    }
     return null;
-  }
-  return null;
+  },
+  toDataURL(type) {
+    const ctx = this._ctx || this.getContext('2d');
+    if (!ctx || !ctx._buf || ctx._w === 0 || ctx._h === 0) return 'data:,';
+    const rgba = new Uint8Array(ctx._buf.buffer, ctx._buf.byteOffset, ctx._buf.byteLength);
+    return Deno.core.ops.op_canvas_encode_png(ctx._w, ctx._h, rgba);
+  },
+  toBlob(cb, type, q) {
+    const url = this.toDataURL(type, q);
+    const comma = url.indexOf(',');
+    if (comma < 0 || !url.startsWith('data:image/')) { cb(null); return; }
+    const binary = atob(url.slice(comma + 1));
+    const bytes = new Uint8Array(binary.length);
+    for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+    cb(new Blob([bytes], {type: String(type || 'image/png')}));
+  },
 };
-HTMLCanvasElement.prototype.toDataURL = function(type) {
-  const ctx = this._ctx || this.getContext('2d');
-  if (ctx && ctx._buf) {
-    if (ctx._w === 0 || ctx._h === 0) return 'data:,';
-    return _encodePNG(ctx._w, ctx._h, ctx._buf);
-  }
-  return 'data:,';
-};
-HTMLCanvasElement.prototype.toBlob = function(cb, type, q) {
-  const url = this.toDataURL(type, q);
-  const comma = url.indexOf(',');
-  if (comma < 0 || !url.startsWith('data:image/')) { cb(null); return; }
-  const binary = atob(url.slice(comma + 1));
-  const bytes = new Uint8Array(binary.length);
-  for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
-  cb(new Blob([bytes], {type: String(type || 'image/png')}));
-};
+for (const name of Object.keys(_canvasElementOperations)) {
+  Object.defineProperty(HTMLCanvasElement.prototype, name, {
+    value: _markNative(_canvasElementOperations[name]),
+    writable: true, enumerable: true, configurable: true,
+  });
+}
 Element.prototype.getBBox = function() { return { x: 0, y: 0, width: 0, height: 0 }; };
 Element.prototype.getComputedTextLength = function() { return 0; };
 Element.prototype.getExtentOfChar = function(ch) { return { x: 0, y: 0, width: 0, height: 0 }; };
@@ -13651,6 +13601,40 @@ navigator.keyboard = {
 };
 navigator.gpu = { requestAdapter() { return Promise.resolve(null); } };
 navigator.wakeLock = { request() { return Promise.reject(new DOMException('Not allowed', 'NotAllowedError')); } };
+
+// Chrome's navigator instance has no own data properties: every member is a
+// native accessor on Navigator.prototype (or a shared ancestor). Obscura builds
+// the members as own data properties for convenience, which fingerprinting
+// scripts detect two ways — `getOwnPropertyDescriptor(navigator, x)` returning a
+// data descriptor (CreepJS "failed undefined properties"), and reading
+// `descriptor.get.toString()` for a native marker (BrowserScan's native-navigator
+// check, which also throws on the `doNotTrack: null` data value). Lift each
+// remaining own member onto the prototype as a native getter that returns the
+// captured value, leaving the instance own-property-free like Chrome.
+(function _liftNavigatorMembersToPrototype() {
+  var navigatorPrototype = Object.getPrototypeOf(globalThis.navigator);
+  // A per-member factory so each getter closes over its own captured value,
+  // not a shared loop variable.
+  function nativeValueGetter(value) {
+    return _markNative(function () { return value; });
+  }
+  var ownMemberNames = Object.getOwnPropertyNames(globalThis.navigator);
+  for (var i = 0; i < ownMemberNames.length; i++) {
+    var name = ownMemberNames[i];
+    var descriptor = Object.getOwnPropertyDescriptor(globalThis.navigator, name);
+    // Only plain, configurable data members are Obscura's own convenience props;
+    // never disturb an accessor or a locked-down slot.
+    if (!descriptor || !('value' in descriptor) || !descriptor.configurable) { continue; }
+    delete globalThis.navigator[name];
+    // A member the prototype already exposes (userAgent, platform, plugins, …)
+    // keeps its existing lazy native getter.
+    if (name in navigatorPrototype) { continue; }
+    Object.defineProperty(navigatorPrototype, name, {
+      get: nativeValueGetter(descriptor.value),
+      set: undefined, enumerable: true, configurable: true,
+    });
+  }
+})();
 
 globalThis.opener = null;
 

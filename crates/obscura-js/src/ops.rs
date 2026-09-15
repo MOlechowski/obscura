@@ -4914,6 +4914,37 @@ fn op_binding_called(state: &OpState, #[string] name: &str, #[string] payload: &
         .push((name.to_string(), payload.to_string()));
 }
 
+/// Encode a canvas RGBA surface as a compressed PNG data URL for
+/// `HTMLCanvasElement.toDataURL` / `toBlob`.
+#[op2]
+#[string]
+fn op_canvas_encode_png(
+    width: u32,
+    height: u32,
+    #[buffer] rgba: &[u8],
+) -> Result<String, deno_error::JsErrorBox> {
+    let expected_len = width as usize * height as usize * 4;
+    if rgba.len() != expected_len {
+        return Err(deno_error::JsErrorBox::generic(format!(
+            "canvas encode png: expected {expected_len} RGBA bytes, got {}",
+            rgba.len()
+        )));
+    }
+    let mut encoded = Vec::new();
+    {
+        let mut encoder = png::Encoder::new(&mut encoded, width, height);
+        encoder.set_color(png::ColorType::Rgba);
+        encoder.set_depth(png::BitDepth::Eight);
+        let mut writer = encoder.write_header().map_err(|e| {
+            deno_error::JsErrorBox::generic(format!("canvas encode png: write header: {e}"))
+        })?;
+        writer.write_image_data(rgba).map_err(|e| {
+            deno_error::JsErrorBox::generic(format!("canvas encode png: write image data: {e}"))
+        })?;
+    }
+    Ok(format!("data:image/png;base64,{}", BASE64.encode(&encoded)))
+}
+
 /// Real WebCrypto `crypto.subtle.digest`. `algorithm` is the SubtleCrypto
 /// algorithm name (`SHA-1` / `SHA-256` / `SHA-384` / `SHA-512`, plus the
 /// FIPS 180-4 truncated variants `SHA-512/224` and `SHA-512/256`). The JS
@@ -5683,6 +5714,7 @@ pub fn build_extension() -> Extension {
         op_posted_task(),
         op_posted_task_generation(),
         op_binding_called(),
+        op_canvas_encode_png(),
         op_subtle_digest(),
         op_subtle_hmac(),
         op_subtle_aes_gcm(),

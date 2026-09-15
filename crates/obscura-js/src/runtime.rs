@@ -559,6 +559,11 @@ impl ObscuraJsRuntime {
                 startup_snapshot: Some(SNAPSHOT),
                 ..Default::default()
             });
+            // Before any page script can observe a stack: replace deno_core's
+            // formatter with the Chrome-shaped wrapper around it.
+            runtime
+                .v8_isolate()
+                .set_prepare_stack_trace_callback(crate::stack_trace::prepare_stack_trace_callback);
 
             {
                 let op_state = runtime.op_state();
