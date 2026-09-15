@@ -4914,6 +4914,18 @@ fn op_binding_called(state: &OpState, #[string] name: &str, #[string] payload: &
         .push((name.to_string(), payload.to_string()));
 }
 
+/// The stealth WebGL fingerprint: a real Apple-Silicon GPU's complete parameter
+/// set, extension list, and shader-precision table (derived from Camoufox's
+/// webgl_data.db), with the six identity strings rewritten to Chrome-on-macOS
+/// values. Bundled as JSON and parsed once by the JS WebGL context so the whole
+/// fingerprint stays internally consistent (Metal renderer ⇔ its own precisions
+/// and extensions), which is what fingerprinting scripts cross-check.
+#[op2]
+#[string]
+fn op_webgl_fingerprint() -> &'static str {
+    include_str!("webgl_fingerprint.json")
+}
+
 /// Encode a canvas RGBA surface as a compressed PNG data URL for
 /// `HTMLCanvasElement.toDataURL` / `toBlob`.
 #[op2]
@@ -5714,6 +5726,7 @@ pub fn build_extension() -> Extension {
         op_posted_task(),
         op_posted_task_generation(),
         op_binding_called(),
+        op_webgl_fingerprint(),
         op_canvas_encode_png(),
         op_subtle_digest(),
         op_subtle_hmac(),
