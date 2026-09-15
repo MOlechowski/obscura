@@ -1124,6 +1124,7 @@ impl Page {
                 context.cookie_jar.clone(),
                 context.proxy_url.as_deref(),
                 context.allow_private_network,
+                context.stealth_platform,
             )))
         } else {
             None
@@ -1807,12 +1808,13 @@ impl Page {
 
         #[cfg(feature = "stealth")]
         if self.stealth_client.is_some() {
+            let p = self.context.stealth_platform;
             rt.set_stealth(true);
-            rt.set_user_agent(obscura_net::STEALTH_USER_AGENT);
+            rt.set_user_agent(p.user_agent());
             rt.set_platform(
-                obscura_net::STEALTH_NAVIGATOR_PLATFORM,
-                obscura_net::STEALTH_UA_PLATFORM,
-                obscura_net::STEALTH_UA_PLATFORM_VERSION,
+                p.navigator_platform(),
+                p.ua_platform(),
+                p.ua_platform_version(),
             );
         } else {
             if let Ok(ua) = self.http_client.user_agent.try_read() {
@@ -2376,6 +2378,8 @@ impl Page {
         }
 
         let client = self.http_client.clone();
+        #[cfg(feature = "stealth")]
+        let stealth_client = self.stealth_client.clone();
         let page_callbacks = self.callbacks.clone();
         let script_initiator = self
             .url
@@ -2385,6 +2389,8 @@ impl Page {
             .iter()
             .map(|(idx, url)| {
                 let client = client.clone();
+                #[cfg(feature = "stealth")]
+                let stealth_client = stealth_client.clone();
                 let cbs = page_callbacks.clone();
                 let initiator = script_initiator.clone();
                 let url = url.clone();
@@ -2417,10 +2423,15 @@ impl Page {
                         return Some((idx, url, resp));
                     }
                     let request = ResourceRequest::subresource(ResourceType::Script, &initiator);
-                    match client
-                        .fetch_resource_with_callbacks(&parsed, request, Some(&cbs))
-                        .await
-                    {
+                    #[cfg(feature = "stealth")]
+                    let response = if let Some(stealth) = stealth_client {
+                        stealth.fetch_resource_with_callbacks(&parsed, request, Some(&cbs)).await
+                    } else {
+                        client.fetch_resource_with_callbacks(&parsed, request, Some(&cbs)).await
+                    };
+                    #[cfg(not(feature = "stealth"))]
+                    let response = client.fetch_resource_with_callbacks(&parsed, request, Some(&cbs)).await;
+                    match response {
                         Ok(resp) => Some((idx, url, resp)),
                         Err(e) => {
                             tracing::warn!("Failed to fetch script {}: {}", url, e);
@@ -3344,9 +3355,15 @@ impl Page {
                 redirected_from: Vec::new(),
             })
         } else if method == "POST" {
-            self.http_client
-                .post_form_with_callbacks(&url, body, Some(&self.callbacks))
-                .await
+            #[cfg(feature = "stealth")]
+            let response = if let Some(stealth) = &self.stealth_client {
+                stealth.post_form_with_callbacks(&url, body, Some(&self.callbacks)).await
+            } else {
+                self.http_client.post_form_with_callbacks(&url, body, Some(&self.callbacks)).await
+            };
+            #[cfg(not(feature = "stealth"))]
+            let response = self.http_client.post_form_with_callbacks(&url, body, Some(&self.callbacks)).await;
+            response
         } else {
             self.do_fetch(&url).await
         }

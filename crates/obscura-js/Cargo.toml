@@ -51,4 +51,8 @@ pbkdf2 = { version = "0.12", default-features = false, features = ["hmac"] }
 hkdf = "0.12"
 # CSPRNG for getRandomValues / randomUUID (replaces Math.random).
 getrandom = "0.2"
+# Canvas toDataURL/toBlob PNG encoding. Chrome compresses its PNG output; the
+# former stored-block encoder produced payloads that fingerprint collectors
+# reject as too large (HTTP 413).
+png = "0.18"
 obscura-render = { workspace = true, optional = true }

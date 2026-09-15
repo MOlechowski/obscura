@@ -2940,45 +2940,55 @@ async fn op_fetch_url(
         && mode == "cors"
         && (!is_cors_safelisted_method(&req_method) || !unsafe_header_names.is_empty());
 
+    #[cfg(feature = "stealth")]
+    let stealth_client = {
+        let st = state.borrow();
+        let gs = st.borrow::<SharedState>().clone();
+        let client = gs.borrow().stealth_client.clone();
+        client
+    };
+
     if needs_preflight {
-        let mut preflight_request = client
-            .request(reqwest::Method::OPTIONS, &url)
-            .timeout(fetch_timeout())
-            .header("Origin", &page_origin)
-            .header("Access-Control-Request-Method", method.as_str());
+        let mut headers = std::collections::HashMap::from([
+            ("Origin".to_string(), page_origin.clone()),
+            ("Access-Control-Request-Method".to_string(), method.clone()),
+        ]);
         if !unsafe_header_names.is_empty() {
-            preflight_request = preflight_request.header(
-                "Access-Control-Request-Headers",
-                unsafe_header_names.join(","),
-            );
+            headers.insert("Access-Control-Request-Headers".to_string(), unsafe_header_names.join(","));
         }
-        let preflight = preflight_request
-            .send()
-            .await
-            .map_err(|e| {
-                deno_error::JsErrorBox::generic(format!("CORS preflight failed: {}", e))
-            })?;
+        let ordinary_preflight = async {
+            let mut request = client.request(reqwest::Method::OPTIONS, &url).timeout(fetch_timeout());
+            for (name, value) in &headers {
+                request = request.header(name.as_str(), value.as_str());
+            }
+            let response = request.send().await.map_err(|e| e.to_string())?;
+            Ok::<_, String>((response.status(), response.headers().clone()))
+        };
+        #[cfg(feature = "stealth")]
+        let preflight = if let Some(stealth) = &stealth_client {
+            let parsed = url::Url::parse(&url).map_err(|e| deno_error::JsErrorBox::generic(e.to_string()))?;
+            stealth.send_preflight(&parsed, &headers, fetch_timeout()).await.map_err(|e| e.to_string())
+        } else {
+            ordinary_preflight.await
+        };
+        #[cfg(not(feature = "stealth"))]
+        let preflight = ordinary_preflight.await;
+        let (preflight_status, preflight_headers) = preflight.map_err(|e|
+            deno_error::JsErrorBox::generic(format!("CORS preflight failed: {}", e)))?;
 
         // Fetch spec: the preflight response's status must be an ok status
         // before its CORS headers are consulted (#973).
-        if !preflight.status().is_success() {
+        if !preflight_status.is_success() {
             return Err(deno_error::JsErrorBox::generic(format!(
                 "CORS preflight returned HTTP {}",
-                preflight.status()
+                preflight_status
             )));
         }
 
-        let allowed_origin = preflight
-            .headers()
-            .get("access-control-allow-origin")
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or("");
-
-        let allow_credentials = preflight
-            .headers()
-            .get("access-control-allow-credentials")
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or("");
+        let allowed_origin = preflight_headers.get("access-control-allow-origin")
+            .and_then(|v| v.to_str().ok()).unwrap_or("");
+        let allow_credentials = preflight_headers.get("access-control-allow-credentials")
+            .and_then(|v| v.to_str().ok()).unwrap_or("");
         if !cors_response_allows(credentials, &page_origin, allowed_origin, allow_credentials) {
             return Err(deno_error::JsErrorBox::generic(format!(
                 "CORS preflight: Origin '{}' not allowed by Access-Control-Allow-Origin '{}'",
@@ -2987,7 +2997,7 @@ async fn op_fetch_url(
         }
 
         let allowed_methods = parse_cors_header_list(
-            preflight.headers(),
+            &preflight_headers,
             "access-control-allow-methods",
         )
         .ok_or_else(|| {
@@ -2996,7 +3006,7 @@ async fn op_fetch_url(
             )
         })?;
         let allowed_headers = parse_cors_header_list(
-            preflight.headers(),
+            &preflight_headers,
             "access-control-allow-headers",
         )
         .ok_or_else(|| {
@@ -3027,13 +3037,7 @@ async fn op_fetch_url(
     // redirect hop without losing the Chrome TLS/client-hint transport.
     #[cfg(feature = "stealth")]
     {
-        let stealth = {
-            let st = state.borrow();
-            let gs = st.borrow::<SharedState>().clone();
-            let client = gs.borrow().stealth_client.clone();
-            client
-        };
-        if let Some(stealth) = stealth {
+        if let Some(stealth) = stealth_client {
             return stealth_fetch_all(
                 stealth,
                 url.clone(),
@@ -4910,6 +4914,49 @@ fn op_binding_called(state: &OpState, #[string] name: &str, #[string] payload: &
         .push((name.to_string(), payload.to_string()));
 }
 
+/// The stealth WebGL fingerprint: a real Apple-Silicon GPU's complete parameter
+/// set, extension list, and shader-precision table (derived from Camoufox's
+/// webgl_data.db), with the six identity strings rewritten to Chrome-on-macOS
+/// values. Bundled as JSON and parsed once by the JS WebGL context so the whole
+/// fingerprint stays internally consistent (Metal renderer ⇔ its own precisions
+/// and extensions), which is what fingerprinting scripts cross-check.
+#[op2]
+#[string]
+fn op_webgl_fingerprint() -> &'static str {
+    include_str!("webgl_fingerprint.json")
+}
+
+/// Encode a canvas RGBA surface as a compressed PNG data URL for
+/// `HTMLCanvasElement.toDataURL` / `toBlob`.
+#[op2]
+#[string]
+fn op_canvas_encode_png(
+    width: u32,
+    height: u32,
+    #[buffer] rgba: &[u8],
+) -> Result<String, deno_error::JsErrorBox> {
+    let expected_len = width as usize * height as usize * 4;
+    if rgba.len() != expected_len {
+        return Err(deno_error::JsErrorBox::generic(format!(
+            "canvas encode png: expected {expected_len} RGBA bytes, got {}",
+            rgba.len()
+        )));
+    }
+    let mut encoded = Vec::new();
+    {
+        let mut encoder = png::Encoder::new(&mut encoded, width, height);
+        encoder.set_color(png::ColorType::Rgba);
+        encoder.set_depth(png::BitDepth::Eight);
+        let mut writer = encoder.write_header().map_err(|e| {
+            deno_error::JsErrorBox::generic(format!("canvas encode png: write header: {e}"))
+        })?;
+        writer.write_image_data(rgba).map_err(|e| {
+            deno_error::JsErrorBox::generic(format!("canvas encode png: write image data: {e}"))
+        })?;
+    }
+    Ok(format!("data:image/png;base64,{}", BASE64.encode(&encoded)))
+}
+
 /// Real WebCrypto `crypto.subtle.digest`. `algorithm` is the SubtleCrypto
 /// algorithm name (`SHA-1` / `SHA-256` / `SHA-384` / `SHA-512`, plus the
 /// FIPS 180-4 truncated variants `SHA-512/224` and `SHA-512/256`). The JS
@@ -5679,6 +5726,8 @@ pub fn build_extension() -> Extension {
         op_posted_task(),
         op_posted_task_generation(),
         op_binding_called(),
+        op_webgl_fingerprint(),
+        op_canvas_encode_png(),
         op_subtle_digest(),
         op_subtle_hmac(),
         op_subtle_aes_gcm(),

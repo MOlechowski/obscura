@@ -777,10 +777,7 @@ const _consoleRemoteObject = (value) => {
   }
   if (type === "symbol") return { type, description: String(value) };
   if (value instanceof Error) {
-    const _pst = Error.prepareStackTrace;
-    if (_pst !== undefined) Error.prepareStackTrace = undefined;
-    const description = value.stack || value.message || String(value);
-    if (_pst !== undefined) Error.prepareStackTrace = _pst;
+    const description = _consoleErrorText(value);
     return {
       type: "object", subtype: "error",
       className: (value.constructor && value.constructor.name) || "Error",
@@ -801,18 +798,33 @@ const _consoleRemoteObject = (value) => {
   remote.objectId = _consoleObjectId(value);
   return remote;
 };
+// Chrome without an attached inspector never runs page code while logging an
+// Error. Pages detect CDP by logging an Error whose `stack` is a getter and
+// checking whether it ran (BrowserScan, deviceandbrowserinfo), so logging reads
+// only V8's own native stack accessor and plain data properties.
+const _nativeErrorStackGetter = Object.getOwnPropertyDescriptor(new Error(), "stack").get;
+const _consoleErrorText = (error) => {
+  const userPrepareStackTrace = Error.prepareStackTrace;
+  if (userPrepareStackTrace !== undefined) Error.prepareStackTrace = undefined;
+  try {
+    const stack = Object.getOwnPropertyDescriptor(error, "stack");
+    if (stack && stack.get === _nativeErrorStackGetter) {
+      const text = _nativeErrorStackGetter.call(error);
+      if (text) return String(text);
+    }
+    const message = Object.getOwnPropertyDescriptor(error, "message");
+    if (message && "value" in message && message.value) return String(message.value);
+    return "Error";
+  } finally {
+    if (userPrepareStackTrace !== undefined) Error.prepareStackTrace = userPrepareStackTrace;
+  }
+};
 const _consoleFn = (level, args) => {
   try {
     const text = args.map(a => {
       if (a === null) return "null";
       if (a === undefined) return "undefined";
-      if (a instanceof Error) {
-        const _pst = Error.prepareStackTrace;
-        if (_pst !== undefined) Error.prepareStackTrace = undefined;
-        const _s = a.stack || a.message || String(a);
-        if (_pst !== undefined) Error.prepareStackTrace = _pst;
-        return _s;
-      }
+      if (a instanceof Error) return _consoleErrorText(a);
       if (typeof a === "object") {
         try {
           const s = JSON.stringify(a);
@@ -6070,10 +6082,14 @@ function _imageEncodingError() {
 // layout/paint. The render-only native op owns responsive candidate selection,
 // fetching, and metadata sniffing; bootstrap owns only the observable request
 // state and event timing.
+// Chrome renders a broken image's default placeholder icon at 16x16 CSS px.
+const _BROKEN_IMAGE_SIZE = 16;
+
 class HTMLImageElement extends Element {
   constructor(nid) {
     super(nid);
     this._imageRequest = 0;
+    this._imageBroken = false;
     this._imageQueued = false;
     this._imageInitialized = false;
     this._imageCompletionDeferred = false;
@@ -6142,12 +6158,18 @@ class HTMLImageElement extends Element {
 
   get width() {
     const value = Number.parseInt(this.getAttribute("width") || "", 10);
-    return Number.isFinite(value) && value >= 0 ? value : this._imageNaturalWidth;
+    if (Number.isFinite(value) && value >= 0) return value;
+    // A broken image with no author size renders Chrome's 16x16 placeholder
+    // icon, not 0x0 (a headless tell sannysoft checks).
+    if (this._imageBroken && this._imageNaturalWidth === 0) return _BROKEN_IMAGE_SIZE;
+    return this._imageNaturalWidth;
   }
   set width(value) { this.setAttribute("width", Math.max(0, Number(value) || 0)); }
   get height() {
     const value = Number.parseInt(this.getAttribute("height") || "", 10);
-    return Number.isFinite(value) && value >= 0 ? value : this._imageNaturalHeight;
+    if (Number.isFinite(value) && value >= 0) return value;
+    if (this._imageBroken && this._imageNaturalHeight === 0) return _BROKEN_IMAGE_SIZE;
+    return this._imageNaturalHeight;
   }
   set height(value) { this.setAttribute("height", Math.max(0, Number(value) || 0)); }
 
@@ -6327,6 +6349,7 @@ class HTMLImageElement extends Element {
       && (typeof Deno.core.ops.op_image_metadata !== "function"
         || (Number.isFinite(width) && width > 0 && Number.isFinite(height) && height > 0));
     if (loaded) {
+      this._imageBroken = false;
       this._imageDecoded = true;
       this._imageNaturalWidth = Number.isFinite(width) && width > 0 ? Math.round(width) : 0;
       this._imageNaturalHeight = Number.isFinite(height) && height > 0 ? Math.round(height) : 0;
@@ -6335,6 +6358,7 @@ class HTMLImageElement extends Element {
         try { this.dispatchEvent(new Event("load")); } catch (_error) {}
       }
     } else {
+      this._imageBroken = !!this._imageCurrentSrc;
       this._imageDecoded = false;
       this._imageNaturalWidth = 0;
       this._imageNaturalHeight = 0;
@@ -7068,8 +7092,209 @@ globalThis.Notification = class Notification {
   constructor() {}
 };
 
-globalThis.WebGLRenderingContext = class WebGLRenderingContext {};
-globalThis.WebGL2RenderingContext = class WebGL2RenderingContext {};
+// WebGL: a fingerprint-only context (stealth mode). It answers getParameter,
+// getSupportedExtensions, getShaderPrecisionFormat and getContextAttributes from
+// a bundled real Apple-Silicon GPU capture; every drawing entry point is a
+// no-op. This is deliberately not a renderer — see _canvasElementOperations
+// .getContext for why it is gated on stealth.
+class WebGLRenderingContext {}
+class WebGL2RenderingContext {}
+globalThis.WebGLRenderingContext = WebGLRenderingContext;
+globalThis.WebGL2RenderingContext = WebGL2RenderingContext;
+globalThis.WebGLBuffer = class WebGLBuffer {};
+globalThis.WebGLFramebuffer = class WebGLFramebuffer {};
+globalThis.WebGLProgram = class WebGLProgram {};
+globalThis.WebGLRenderbuffer = class WebGLRenderbuffer {};
+globalThis.WebGLShader = class WebGLShader {};
+globalThis.WebGLTexture = class WebGLTexture {};
+globalThis.WebGLUniformLocation = class WebGLUniformLocation {};
+globalThis.WebGLActiveInfo = class WebGLActiveInfo {};
+globalThis.WebGLShaderPrecisionFormat = class WebGLShaderPrecisionFormat {};
+globalThis.WebGLVertexArrayObject = class WebGLVertexArrayObject {};
+globalThis.WebGLQuery = class WebGLQuery {};
+globalThis.WebGLSampler = class WebGLSampler {};
+globalThis.WebGLSync = class WebGLSync {};
+globalThis.WebGLTransformFeedback = class WebGLTransformFeedback {};
+
+// The WebGL enum names fingerprinting scripts read by identifier rather than by
+// numeric literal (getParameter(gl.VERSION), the debug-renderer extension's
+// UNMASKED_* keys, buffer-bit constants, …). Values are the spec constants.
+const _WEBGL_CONSTANTS = {
+  DEPTH_BUFFER_BIT: 0x0100, STENCIL_BUFFER_BIT: 0x0400, COLOR_BUFFER_BIT: 0x4000,
+  POINTS: 0, LINES: 1, TRIANGLES: 4, ARRAY_BUFFER: 0x8892, ELEMENT_ARRAY_BUFFER: 0x8893,
+  STATIC_DRAW: 0x88E4, DYNAMIC_DRAW: 0x88E8, STREAM_DRAW: 0x88E0,
+  FLOAT: 0x1406, UNSIGNED_BYTE: 0x1401, UNSIGNED_SHORT: 0x1403, UNSIGNED_INT: 0x1405,
+  TEXTURE_2D: 0x0DE1, TEXTURE0: 0x84C0, RGBA: 0x1908, RGB: 0x1907,
+  VERTEX_SHADER: 0x8B31, FRAGMENT_SHADER: 0x8B30, COMPILE_STATUS: 0x8B81, LINK_STATUS: 0x8B82,
+  VENDOR: 0x1F00, RENDERER: 0x1F01, VERSION: 0x1F02, SHADING_LANGUAGE_VERSION: 0x8B8C,
+  MAX_TEXTURE_SIZE: 0x0D33, MAX_CUBE_MAP_TEXTURE_SIZE: 0x851C,
+  MAX_RENDERBUFFER_SIZE: 0x84E8, MAX_VIEWPORT_DIMS: 0x0D3A,
+  MAX_TEXTURE_IMAGE_UNITS: 0x8872, MAX_VERTEX_TEXTURE_IMAGE_UNITS: 0x8B4C,
+  MAX_COMBINED_TEXTURE_IMAGE_UNITS: 0x8B4D, MAX_VERTEX_ATTRIBS: 0x8869,
+  MAX_VERTEX_UNIFORM_VECTORS: 0x8DFB, MAX_FRAGMENT_UNIFORM_VECTORS: 0x8DFD,
+  MAX_VARYING_VECTORS: 0x8DFC, ALIASED_LINE_WIDTH_RANGE: 0x846E,
+  ALIASED_POINT_SIZE_RANGE: 0x846D, MAX_TEXTURE_MAX_ANISOTROPY_EXT: 0x84FF,
+  LOW_FLOAT: 0x8DF0, MEDIUM_FLOAT: 0x8DF1, HIGH_FLOAT: 0x8DF2,
+  LOW_INT: 0x8DF3, MEDIUM_INT: 0x8DF4, HIGH_INT: 0x8DF5,
+  UNMASKED_VENDOR_WEBGL: 0x9245, UNMASKED_RENDERER_WEBGL: 0x9246,
+  MAX_DRAW_BUFFERS_WEBGL: 0x8824, NO_ERROR: 0,
+  MAX_3D_TEXTURE_SIZE: 0x8073, MAX_ARRAY_TEXTURE_LAYERS: 0x88FF,
+  MAX_SAMPLES: 0x8D57, MAX_COLOR_ATTACHMENTS: 0x8CDF, MAX_DRAW_BUFFERS: 0x8824,
+  // State parameters fingerprint libraries read by name.
+  VIEWPORT: 0x0BA2, SCISSOR_BOX: 0x0C10, DEPTH_RANGE: 0x0B70,
+  COLOR_CLEAR_VALUE: 0x0C22, COLOR_WRITEMASK: 0x0C23, BLEND_COLOR: 0x8005,
+  RED_BITS: 0x0D52, GREEN_BITS: 0x0D53, BLUE_BITS: 0x0D54, ALPHA_BITS: 0x0D55,
+  DEPTH_BITS: 0x0D56, STENCIL_BITS: 0x0D57, SUBPIXEL_BITS: 0x0D50,
+  SAMPLES: 0x80A9, SAMPLE_BUFFERS: 0x80A8, MAX_TEXTURE_LOD_BIAS: 0x84FD,
+  MAX_VERTEX_UNIFORM_COMPONENTS: 0x8B4A, MAX_FRAGMENT_UNIFORM_COMPONENTS: 0x8B49,
+  MAX_VERTEX_OUTPUT_COMPONENTS: 0x9122, MAX_FRAGMENT_INPUT_COMPONENTS: 0x9125,
+  MAX_VARYING_COMPONENTS: 0x8B4B, MAX_ELEMENT_INDEX: 0x8D6B, MAX_ELEMENTS_INDICES: 0x80E9,
+  MAX_ELEMENTS_VERTICES: 0x80E8, MAX_UNIFORM_BUFFER_BINDINGS: 0x8A2F,
+  MAX_UNIFORM_BLOCK_SIZE: 0x8A30, MAX_COMBINED_UNIFORM_BLOCKS: 0x8A2E,
+  MAX_VERTEX_UNIFORM_BLOCKS: 0x8A2B, MAX_FRAGMENT_UNIFORM_BLOCKS: 0x8A2D,
+  MAX_COMBINED_VERTEX_UNIFORM_COMPONENTS: 0x8A31, MAX_COMBINED_FRAGMENT_UNIFORM_COMPONENTS: 0x8A33,
+  MAX_TRANSFORM_FEEDBACK_SEPARATE_ATTRIBS: 0x8C8A,
+  MAX_TRANSFORM_FEEDBACK_INTERLEAVED_COMPONENTS: 0x8C8C,
+  MAX_TRANSFORM_FEEDBACK_SEPARATE_COMPONENTS: 0x8C80,
+  UNIFORM_BUFFER_OFFSET_ALIGNMENT: 0x8A34, MAX_PROGRAM_TEXEL_OFFSET: 0x8905,
+  MIN_PROGRAM_TEXEL_OFFSET: 0x8904,
+};
+
+// Some getParameter values are typed arrays in a real context, not plain
+// arrays. Keyed by GL enum → the constructor to rehydrate the bundled JSON
+// arrays with; anything else array-valued becomes a Float32Array.
+const _WEBGL_INT32_PARAMS = new Set([0x0BA2 /*VIEWPORT*/, 0x0C10 /*SCISSOR_BOX*/, 0x0D3A /*MAX_VIEWPORT_DIMS*/]);
+const _WEBGL_BOOL_ARRAY_PARAMS = new Set([0x0C23 /*COLOR_WRITEMASK*/]);
+
+let _webglFingerprint = null;
+function _getWebglFingerprint() {
+  if (!_webglFingerprint) {
+    _webglFingerprint = JSON.parse(Deno.core.ops.op_webgl_fingerprint());
+  }
+  return _webglFingerprint;
+}
+
+// WebGL2 inherits WebGL1, so a webgl2 context is `instanceof` both while a webgl
+// context is `instanceof` only WebGLRenderingContext. Methods live on
+// WebGLRenderingContext.prototype; WebGL2RenderingContext.prototype inherits
+// them, and each context instance is created with the matching prototype.
+Object.setPrototypeOf(WebGL2RenderingContext.prototype, WebGLRenderingContext.prototype);
+
+// The private state each context carries, defined non-enumerable so the
+// instance has no own enumerable data properties (a real context has none).
+function _defineWebGLState(context, canvas, data) {
+  Object.defineProperties(context, {
+    _canvas: { value: canvas },
+    _data: { value: data },
+    _extensionCache: { value: new Map() },
+  });
+}
+
+// _WebGLContext is only a factory: it returns an instance whose prototype is the
+// correct interface, never `new`-constructed by page code.
+function _WebGLContext(canvas, isWebGL2) {
+  const fp = _getWebglFingerprint();
+  const context = Object.create(
+    isWebGL2 ? WebGL2RenderingContext.prototype : WebGLRenderingContext.prototype);
+  _defineWebGLState(context, canvas, isWebGL2 ? fp.gl2 : fp.gl1);
+  return context;
+}
+
+(function _defineWebGLInterface() {
+  const proto = WebGLRenderingContext.prototype;
+  function defineGetter(name, fn) {
+    Object.defineProperty(proto, name, { get: _markNative(fn), enumerable: true, configurable: true });
+  }
+  defineGetter('canvas', function () { return this._canvas; });
+  defineGetter('drawingBufferWidth', function () { return this._canvas ? this._canvas.width : 300; });
+  defineGetter('drawingBufferHeight', function () { return this._canvas ? this._canvas.height : 150; });
+  defineGetter('drawingBufferColorSpace', function () { return 'srgb'; });
+
+  function defineMethod(name, fn) {
+    Object.defineProperty(proto, name, { value: _markNative(fn), writable: true, enumerable: true, configurable: true });
+  }
+  defineMethod('getContextAttributes', function () { return Object.assign({}, this._data.attrs); });
+  defineMethod('getSupportedExtensions', function () { return this._data.ext.slice(); });
+  defineMethod('isContextLost', function () { return false; });
+  defineMethod('getParameter', function (pname) {
+    const value = this._data.params[String(pname)];
+    if (value === undefined || value === null) return null;
+    if (Array.isArray(value)) {
+      if (_WEBGL_BOOL_ARRAY_PARAMS.has(pname)) return value.map(Boolean);
+      return _WEBGL_INT32_PARAMS.has(pname) ? new Int32Array(value) : new Float32Array(value);
+    }
+    return value;
+  });
+  defineMethod('getShaderPrecisionFormat', function (shaderType, precisionType) {
+    const record = this._data.prec[shaderType + ',' + precisionType];
+    const format = new WebGLShaderPrecisionFormat();
+    format.rangeMin = record ? record.rangeMin : 127;
+    format.rangeMax = record ? record.rangeMax : 127;
+    format.precision = record ? record.precision : 23;
+    return format;
+  });
+  defineMethod('getExtension', function (name) {
+    const key = String(name);
+    const supported = this._data.ext.includes(key) || key === 'WEBGL_debug_renderer_info';
+    if (!supported) return null;
+    if (this._extensionCache.has(key)) return this._extensionCache.get(key);
+    let extension;
+    if (key === 'WEBGL_debug_renderer_info') {
+      extension = { UNMASKED_VENDOR_WEBGL: 0x9245, UNMASKED_RENDERER_WEBGL: 0x9246 };
+    } else if (key === 'EXT_texture_filter_anisotropic'
+        || key === 'WEBKIT_EXT_texture_filter_anisotropic') {
+      extension = { TEXTURE_MAX_ANISOTROPY_EXT: 0x84FE, MAX_TEXTURE_MAX_ANISOTROPY_EXT: 0x84FF };
+    } else {
+      extension = {};
+    }
+    this._extensionCache.set(key, extension);
+    return extension;
+  });
+
+  // Object-returning creators hand back the matching WebGL* wrapper.
+  const objectReturning = {
+    createBuffer: WebGLBuffer, createFramebuffer: WebGLFramebuffer,
+    createProgram: WebGLProgram, createRenderbuffer: WebGLRenderbuffer,
+    createShader: WebGLShader, createTexture: WebGLTexture,
+    createVertexArray: WebGLVertexArrayObject, createQuery: WebGLQuery,
+    createSampler: WebGLSampler, createTransformFeedback: WebGLTransformFeedback,
+    getUniformLocation: WebGLUniformLocation,
+  };
+  for (const name of Object.keys(objectReturning)) {
+    const Ctor = objectReturning[name];
+    defineMethod(name, function () { return new Ctor(); });
+  }
+  defineMethod('getError', function () { return 0; });
+  defineMethod('checkFramebufferStatus', function () { return 0x8CD5; /* FRAMEBUFFER_COMPLETE */ });
+  defineMethod('getProgramParameter', function () { return true; });
+  defineMethod('getShaderParameter', function () { return true; });
+  defineMethod('getAttribLocation', function () { return 0; });
+  defineMethod('readPixels', function () {});
+  const noops = [
+    'activeTexture','attachShader','bindAttribLocation','bindBuffer','bindFramebuffer',
+    'bindRenderbuffer','bindTexture','blendColor','blendEquation','blendFunc','bufferData',
+    'bufferSubData','clear','clearColor','clearDepth','clearStencil','colorMask','compileShader',
+    'copyTexImage2D','cullFace','deleteBuffer','deleteFramebuffer','deleteProgram',
+    'deleteRenderbuffer','deleteShader','deleteTexture','depthFunc','depthMask','depthRange',
+    'detachShader','disable','disableVertexAttribArray','drawArrays','drawElements','enable',
+    'enableVertexAttribArray','finish','flush','framebufferRenderbuffer','framebufferTexture2D',
+    'frontFace','generateMipmap','hint','lineWidth','linkProgram','pixelStorei','polygonOffset',
+    'renderbufferStorage','sampleCoverage','scissor','shaderSource','stencilFunc','stencilMask',
+    'stencilOp','texImage2D','texParameterf','texParameteri','texSubImage2D','uniform1f',
+    'uniform1i','uniform2f','uniform3f','uniform4f','uniformMatrix4fv','useProgram','validateProgram',
+    'vertexAttribPointer','viewport','bindVertexArray','deleteVertexArray',
+  ];
+  for (const name of noops) defineMethod(name, function () {});
+
+  // Spec enum constants live on the interface object and its prototype, matching
+  // where a real context carries them.
+  for (const key of Object.keys(_WEBGL_CONSTANTS)) {
+    const value = _WEBGL_CONSTANTS[key];
+    WebGLRenderingContext.prototype[key] = value;
+    WebGLRenderingContext[key] = value;
+    WebGL2RenderingContext[key] = value;
+  }
+})();
 
 class Screen {
   constructor(w, h, availW, availH) {
@@ -12903,77 +13128,6 @@ class _IframeWindow {
   blur() {}
 }
 
-// Encode an RGBA pixel buffer into a valid PNG data URL.
-// Uses stored-block DEFLATE (no compression) wrapped in zlib.
-// This produces a larger file than a real browser but the hash is unique
-// per session (from _fpNoise) and valid, so it does not match the known
-// headless stub.
-function _encodePNG(w, h, rgba) {
-  // RGBA scanlines: filter byte (0) + 4 bytes per pixel.
-  var rowLen = 1 + w * 4;
-  var raw = new Uint8Array(h * rowLen);
-  for (var y = 0; y < h; y++) {
-    var base = y * rowLen;
-    raw[base] = 0;
-    for (var x = 0; x < w; x++) {
-      var s = (y * w + x) << 2, d = base + 1 + x * 4;
-      raw[d] = rgba[s]; raw[d+1] = rgba[s+1]; raw[d+2] = rgba[s+2]; raw[d+3] = rgba[s+3];
-    }
-  }
-  // Adler32 of raw
-  var s1 = 1, s2 = 0, M = 65521;
-  for (var i = 0; i < raw.length; i++) { s1 = (s1 + raw[i]) % M; s2 = (s2 + s1) % M; }
-  var adler = ((s2 << 16) | s1) >>> 0;
-  // Stored DEFLATE blocks (zlib level 0)
-  var MAXB = 65535, nb = Math.ceil(raw.length / MAXB) || 1;
-  var dlen = 2 + nb * 5 + raw.length + 4;
-  var def = new Uint8Array(dlen), dp = 0;
-  def[dp++] = 0x78; def[dp++] = 0x01;
-  for (var bi = 0; bi < nb; bi++) {
-    var bs = bi * MAXB, be = Math.min(raw.length, bs + MAXB), bl = be - bs;
-    def[dp++] = bi === nb-1 ? 1 : 0;
-    def[dp++] = bl&0xff; def[dp++] = (bl>>8)&0xff;
-    def[dp++] = (~bl)&0xff; def[dp++] = (~bl>>8)&0xff;
-    def.set(raw.subarray(bs, be), dp); dp += bl;
-  }
-  def[dp++]=(adler>>24)&0xff; def[dp++]=(adler>>16)&0xff; def[dp++]=(adler>>8)&0xff; def[dp]=adler&0xff;
-  // CRC32 (lazy table)
-  if (!_encodePNG._t) {
-    var t = new Uint32Array(256);
-    for (var n = 0; n < 256; n++) { var c = n; for (var k=0;k<8;k++) c=c&1?0xEDB88320^(c>>>1):(c>>>1); t[n]=c; }
-    _encodePNG._t = t;
-  }
-  var T = _encodePNG._t;
-  function crc32(a, st, ln) { var c=0xFFFFFFFF; for(var i=st,e=st+ln;i<e;i++) c=T[(c^a[i])&0xff]^(c>>>8); return (c^0xFFFFFFFF)>>>0; }
-  function putChunk(out, off, type, data) {
-    var dl = data.length;
-    out[off]=(dl>>24)&0xff; out[off+1]=(dl>>16)&0xff; out[off+2]=(dl>>8)&0xff; out[off+3]=dl&0xff;
-    out[off+4]=type.charCodeAt(0); out[off+5]=type.charCodeAt(1); out[off+6]=type.charCodeAt(2); out[off+7]=type.charCodeAt(3);
-    out.set(data, off+8);
-    var cr = crc32(out, off+4, 4+dl);
-    out[off+8+dl]=(cr>>24)&0xff; out[off+9+dl]=(cr>>16)&0xff; out[off+10+dl]=(cr>>8)&0xff; out[off+11+dl]=cr&0xff;
-    return off+12+dl;
-  }
-  var ihd = new Uint8Array(13);
-  ihd[0]=(w>>24)&0xff; ihd[1]=(w>>16)&0xff; ihd[2]=(w>>8)&0xff; ihd[3]=w&0xff;
-  ihd[4]=(h>>24)&0xff; ihd[5]=(h>>16)&0xff; ihd[6]=(h>>8)&0xff; ihd[7]=h&0xff;
-  ihd[8]=8; ihd[9]=6; // 8-bit RGBA
-  var png = new Uint8Array(8 + 25 + (12+dlen) + 12);
-  png.set([0x89,0x50,0x4E,0x47,0x0D,0x0A,0x1A,0x0A]);
-  var p = 8;
-  p = putChunk(png, p, 'IHDR', ihd);
-  p = putChunk(png, p, 'IDAT', def);
-  putChunk(png, p, 'IEND', new Uint8Array(0));
-  // Base64 encode
-  var C = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/';
-  var b64 = 'data:image/png;base64,';
-  for (var i = 0; i < png.length; i += 3) {
-    var a=png[i], b=i+1<png.length?png[i+1]:0, c=i+2<png.length?png[i+2]:0;
-    b64 += C[a>>2] + C[((a&3)<<4)|(b>>4)] + (i+1<png.length?C[((b&15)<<2)|(c>>6)]:'=') + (i+2<png.length?C[c&63]:'=');
-  }
-  return b64;
-}
-
 globalThis.__ariaQuerySelector = function(root, selector) { return null; };
 globalThis.__ariaQuerySelectorAll = async function*(root, selector) { /* yields nothing */ };
 const _MAX_CANVAS_DIMENSION = 32767;
@@ -13258,41 +13412,60 @@ class HTMLCanvasElement extends Element {
 }
 globalThis.HTMLCanvasElement = HTMLCanvasElement;
 
-HTMLCanvasElement.prototype.getContext = function getContext(type) {
-  if (type === '2d') {
-    if (!this._ctx) {
-      try { this._ctx = new _Canvas2D(this); }
-      catch (_error) { return null; }
+// Method shorthand gives these the shape of WebIDL operations: no own
+// `prototype`, not constructible, so `class X extends toDataURL` and
+// `new getContext()` throw like Chrome (CreepJS "lies" checks).
+const _canvasElementOperations = {
+  getContext(type) {
+    if (type === '2d') {
+      if (!this._ctx) {
+        try { this._ctx = new _Canvas2D(this); }
+        catch (_error) { return null; }
+      }
+      return this._ctx;
     }
-    return this._ctx;
-  }
-  if (type === 'webgl' || type === 'experimental-webgl' || type === 'webgl2') {
-    // Context creation is allowed to fail, and that is the only truthful
-    // behavior until the renderer has a real WebGL backend. The former shim
-    // reported successful shader/program creation while every draw call was a
-    // no-op. Feature-detecting applications consequently selected their WebGL
-    // path, hid their HTML/image fallback, and produced a blank canvas.
+    if (type === 'webgl' || type === 'experimental-webgl' || type === 'webgl2') {
+      // Without a rendering backend, a WebGL context can only report a
+      // fingerprint, never draw. Outside stealth mode that trade is not worth
+      // making — a feature-detecting app would pick the WebGL path, get no
+      // pixels, and show a blank canvas — so context creation truthfully fails.
+      // Under --stealth the caller has opted into fingerprint spoofing over
+      // rendering fidelity, and a *missing* WebGL context is itself a strong
+      // headless signal, so expose a context backed by a real Apple-GPU
+      // fingerprint (see _WebGLContext).
+      if (!globalThis.__obscura_stealth) return null;
+      const wantsWebGL2 = type === 'webgl2';
+      const slot = wantsWebGL2 ? '_glctx2' : '_glctx';
+      if (!this[slot]) {
+        try { this[slot] = new _WebGLContext(this, wantsWebGL2); }
+        catch (_error) { return null; }
+      }
+      return this[slot];
+    }
     return null;
-  }
-  return null;
+  },
+  toDataURL(type) {
+    const ctx = this._ctx || this.getContext('2d');
+    if (!ctx || !ctx._buf || ctx._w === 0 || ctx._h === 0) return 'data:,';
+    const rgba = new Uint8Array(ctx._buf.buffer, ctx._buf.byteOffset, ctx._buf.byteLength);
+    return Deno.core.ops.op_canvas_encode_png(ctx._w, ctx._h, rgba);
+  },
+  toBlob(cb, type, q) {
+    const url = this.toDataURL(type, q);
+    const comma = url.indexOf(',');
+    if (comma < 0 || !url.startsWith('data:image/')) { cb(null); return; }
+    const binary = atob(url.slice(comma + 1));
+    const bytes = new Uint8Array(binary.length);
+    for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+    cb(new Blob([bytes], {type: String(type || 'image/png')}));
+  },
 };
-HTMLCanvasElement.prototype.toDataURL = function(type) {
-  const ctx = this._ctx || this.getContext('2d');
-  if (ctx && ctx._buf) {
-    if (ctx._w === 0 || ctx._h === 0) return 'data:,';
-    return _encodePNG(ctx._w, ctx._h, ctx._buf);
-  }
-  return 'data:,';
-};
-HTMLCanvasElement.prototype.toBlob = function(cb, type, q) {
-  const url = this.toDataURL(type, q);
-  const comma = url.indexOf(',');
-  if (comma < 0 || !url.startsWith('data:image/')) { cb(null); return; }
-  const binary = atob(url.slice(comma + 1));
-  const bytes = new Uint8Array(binary.length);
-  for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
-  cb(new Blob([bytes], {type: String(type || 'image/png')}));
-};
+for (const name of Object.keys(_canvasElementOperations)) {
+  Object.defineProperty(HTMLCanvasElement.prototype, name, {
+    value: _markNative(_canvasElementOperations[name]),
+    writable: true, enumerable: true, configurable: true,
+  });
+}
 Element.prototype.getBBox = function() { return { x: 0, y: 0, width: 0, height: 0 }; };
 Element.prototype.getComputedTextLength = function() { return 0; };
 Element.prototype.getExtentOfChar = function(ch) { return { x: 0, y: 0, width: 0, height: 0 }; };
@@ -13651,6 +13824,40 @@ navigator.keyboard = {
 };
 navigator.gpu = { requestAdapter() { return Promise.resolve(null); } };
 navigator.wakeLock = { request() { return Promise.reject(new DOMException('Not allowed', 'NotAllowedError')); } };
+
+// Chrome's navigator instance has no own data properties: every member is a
+// native accessor on Navigator.prototype (or a shared ancestor). Obscura builds
+// the members as own data properties for convenience, which fingerprinting
+// scripts detect two ways — `getOwnPropertyDescriptor(navigator, x)` returning a
+// data descriptor (CreepJS "failed undefined properties"), and reading
+// `descriptor.get.toString()` for a native marker (BrowserScan's native-navigator
+// check, which also throws on the `doNotTrack: null` data value). Lift each
+// remaining own member onto the prototype as a native getter that returns the
+// captured value, leaving the instance own-property-free like Chrome.
+(function _liftNavigatorMembersToPrototype() {
+  var navigatorPrototype = Object.getPrototypeOf(globalThis.navigator);
+  // A per-member factory so each getter closes over its own captured value,
+  // not a shared loop variable.
+  function nativeValueGetter(value) {
+    return _markNative(function () { return value; });
+  }
+  var ownMemberNames = Object.getOwnPropertyNames(globalThis.navigator);
+  for (var i = 0; i < ownMemberNames.length; i++) {
+    var name = ownMemberNames[i];
+    var descriptor = Object.getOwnPropertyDescriptor(globalThis.navigator, name);
+    // Only plain, configurable data members are Obscura's own convenience props;
+    // never disturb an accessor or a locked-down slot.
+    if (!descriptor || !('value' in descriptor) || !descriptor.configurable) { continue; }
+    delete globalThis.navigator[name];
+    // A member the prototype already exposes (userAgent, platform, plugins, …)
+    // keeps its existing lazy native getter.
+    if (name in navigatorPrototype) { continue; }
+    Object.defineProperty(navigatorPrototype, name, {
+      get: nativeValueGetter(descriptor.value),
+      set: undefined, enumerable: true, configurable: true,
+    });
+  }
+})();
 
 globalThis.opener = null;
 
